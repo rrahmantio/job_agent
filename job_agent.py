@@ -116,11 +116,17 @@ class Job:
 
 
 def env(name: str, default: str | None = None, required: bool = False) -> str:
-    value = os.getenv(name, default)
+    value = os.getenv(name)
+
+    # Treat an unset OR empty environment variable as missing,
+    # so optional variables correctly fall back to their defaults.
+    if not value:
+        value = default
+
     if required and not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
-    return value or ""
 
+    return value or ""
 
 def search_serper(query: str, num: int = 10) -> list[dict[str, Any]]:
     r = requests.post(
