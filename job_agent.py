@@ -224,7 +224,7 @@ def discover_jobs() -> list[Job]:
         combined = f"{job.title}\n{job.snippet}\n{page}"
         job.status = "closed" if looks_closed(combined) else "candidate"
         if page:
-            # Preserve enough detail for scoring without creating giant prompts.
+            # Preserve enough detail for scoring without creating giant s.
             job.snippet = (job.snippet + "\n" + page[:7000])[:9000]
         if job.status != "closed":
             jobs.append(job)
@@ -295,7 +295,7 @@ Rules:
 """
 
     response = client.responses.create(
-        model=env("OPENAI_MODEL", "gpt-4.1-mini"),
+        model="gpt-4.1-mini",
         input=prompt,
         text={
             "format": {
