@@ -1,0 +1,31 @@
+{
+  "target_countries": ["Australia", "Singapore"],
+  "min_score": 72,
+  "priority_roles": [
+    "Solutions Consultant",
+    "Solutions Engineer",
+    "Solutions Architect",
+    "Principal Consultant",
+    "AI Deployment Strategist",
+    "AI Transformation",
+    "AI Strategy",
+    "Customer Solutions",
+    "Technical GTM",
+    "Enterprise AI"
+  ],
+  "priority_companies": [
+    "Mantel Group",
+    "Altis Consulting",
+    "Relevance AI",
+    "Ailytics",
+    "RegASK",
+    "CloudMile",
+    "Mixpanel",
+    "Versent",
+    "Kasada",
+    "Horizon3.ai",
+    "Appier",
+    "PatSnap"
+  ],
+  "visa_rule": "Prefer explicit sponsorship or relocation. Never treat multinational status alone as proof of sponsorship."
+}

@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.secrets
+seen_jobs.sqlite3
+.env
