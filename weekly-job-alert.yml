@@ -1,0 +1,52 @@
+name: Weekly APAC AI Job Alert
+
+on:
+  schedule:
+    # Every Monday, 08:00 Jakarta time (01:00 UTC)
+    - cron: "0 1 * * 1"
+  workflow_dispatch:
+
+jobs:
+  search-and-email:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore seen-job database
+        uses: actions/cache@v4
+        with:
+          path: seen_jobs.sqlite3
+          key: seen-jobs-${{ github.run_id }}
+          restore-keys: |
+            seen-jobs-
+
+      - name: Run career agent
+        env:
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: 465
+          MIN_SCORE: "72"
+          MAX_RESULTS_PER_QUERY: "10"
+        run: python job_agent.py
+
+      - name: Persist seen-job database
+        uses: actions/upload-artifact@v4
+        with:
+          name: seen-jobs-${{ github.run_id }}
+          path: seen_jobs.sqlite3
+          retention-days: 90
