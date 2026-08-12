@@ -46,6 +46,22 @@ MAX_EMAIL_JOBS = 20
 FETCH_WORKERS = 8
 SCORE_WORKERS = 6
 
+# Salary estimator assumptions:
+# - Gross salary is annualized in the job's local currency.
+# - Singapore: foreign employee, assumed Singapore tax resident for an ongoing
+#   full-year employment; no CPF; no spouse/child relief assumed because
+#   eligibility depends on the family's income/conditions.
+# - Australia: assumed Australian tax resident for an ongoing full tax year;
+#   2% Medicare levy included. A foreign-resident tax scenario is materially
+#   different, so the email explicitly labels this as an assumption.
+# - FX is refreshed at runtime from a public USD FX endpoint, with conservative
+#   fallbacks so a transient FX outage cannot break the job agent.
+FX_URL = "https://open.er-api.com/v6/latest/USD"
+FALLBACK_USD_IDR = 16700.0
+FALLBACK_USD_AUD = 1.53
+FALLBACK_USD_SGD = 1.28
+AU_MEDICARE_LEVY = 0.02
+
 PROFILE = """
 Candidate based in Jakarta, Indonesia, currently a Presales Manager at CKDelta
 (part of Indosat Ooredoo Hutchison Group).
@@ -114,6 +130,17 @@ class Job:
     previous_rank: int | None = None
     current_rank: int | None = None
     label: str = ""
+    salary_status: str = "not_available"
+    salary_currency: str = ""
+    salary_period: str = "annual"
+    salary_low: float | None = None
+    salary_high: float | None = None
+    salary_average: float | None = None
+    salary_source_note: str = ""
+    salary_confidence: str = ""
+    net_monthly_idr: float | None = None
+    fx_to_idr: float | None = None
+    tax_note: str = ""
 
 
 def env(name: str, default: str | None = None, required: bool = False) -> str:
@@ -347,6 +374,22 @@ SCHEMA = {
         "company_size": {"type": "string"},
         "rationale": {"type": "string"},
         "cv_tweak": {"type": "string"},
+        "salary_status": {
+            "type": "string",
+            "enum": ["posted", "estimated", "not_available"],
+        },
+        "salary_currency": {"type": "string"},
+        "salary_period": {
+            "type": "string",
+            "enum": ["annual", "monthly", "weekly", "hourly", "not_available"],
+        },
+        "salary_low": {"type": ["number", "null"]},
+        "salary_high": {"type": ["number", "null"]},
+        "salary_confidence": {
+            "type": "string",
+            "enum": ["high", "medium", "low", "not_available"],
+        },
+        "salary_source_note": {"type": "string"},
     },
     "required": [
         "company",
@@ -360,6 +403,13 @@ SCHEMA = {
         "company_size",
         "rationale",
         "cv_tweak",
+        "salary_status",
+        "salary_currency",
+        "salary_period",
+        "salary_low",
+        "salary_high",
+        "salary_confidence",
+        "salary_source_note",
     ],
     "additionalProperties": False,
 }
@@ -430,6 +480,30 @@ Score 0-100:
 Only set is_target=true if the role is genuinely strong and score >= 72.
 Tier must be exactly "A" or "B" for a target.
 
+SALARY ESTIMATION:
+- Extract salary ONLY from the supplied posting/search text when it is explicitly
+  stated. If the posting explicitly states a salary/range, set salary_status
+  to "posted" and salary_source_note to "From the job posting itself."
+- If the posting does not state salary, set salary_status to "estimated" and
+  estimate a realistic gross market salary band for THIS specific role, level,
+  company type and city in the local currency. Do not pretend this is a sourced
+  salary figure.
+- For an estimate, give a reasonable low/high annualized gross range. Use
+  salary_period="annual" for the returned normalized values.
+- If the posting is too ambiguous to estimate responsibly, use
+  salary_status="not_available".
+- For Australia, distinguish base salary from superannuation when the posting
+  makes that distinction. If a package is explicitly "including super", estimate
+  the base salary by removing the current 12% super component before tax.
+- Do not include equity, bonuses, commission, allowances or benefits in the
+  gross salary band unless the posting clearly defines them as guaranteed base
+  salary.
+- Confidence: high only when the posting states salary; medium for a reasonably
+  grounded market estimate; low when the role/company/level makes the estimate
+  unusually uncertain.
+- IMPORTANT: salary_status="posted" must never be used just because a salary
+  appears in a search-engine snippet unrelated to the actual role.
+
 Return a concise rationale and 2-4 concrete CV tweaks.
 """
 
@@ -458,6 +532,22 @@ Return a concise rationale and 2-4 concrete CV tweaks.
     job.rationale = data["rationale"].strip()
     job.cv_tweak = data["cv_tweak"].strip()
     job.specific = bool(data["is_specific_posting"])
+
+    job.salary_status = data["salary_status"].strip()
+    job.salary_currency = data["salary_currency"].strip().upper()
+    job.salary_period = data["salary_period"].strip()
+    job.salary_low = data["salary_low"]
+    job.salary_high = data["salary_high"]
+    job.salary_confidence = data["salary_confidence"].strip()
+    job.salary_source_note = data["salary_source_note"].strip()
+
+    if job.salary_status == "posted":
+        job.salary_source_note = "From the job posting itself."
+    elif job.salary_status == "estimated":
+        job.salary_source_note = (
+            "Estimate only — not official. Based on role, level, company and market."
+        )
+
     job.status = "target" if data["is_target"] else "reject"
 
     if not job.specific:
@@ -470,6 +560,194 @@ Return a concise rationale and 2-4 concrete CV tweaks.
         job.status = "reject"
 
     return job
+
+
+
+def fetch_fx_to_idr() -> dict[str, float]:
+    """Return local-currency -> IDR rates, using USD as the bridge."""
+    try:
+        response = requests.get(FX_URL, timeout=8)
+        response.raise_for_status()
+        data = response.json()
+        rates = data.get("rates", {})
+
+        usd_idr = float(rates["IDR"])
+        usd_aud = float(rates["AUD"])
+        usd_sgd = float(rates["SGD"])
+
+        return {
+            "AUD": usd_idr / usd_aud,
+            "SGD": usd_idr / usd_sgd,
+        }
+    except Exception as exc:
+        print(f"[WARN] FX refresh failed; using fallback rates: {exc}")
+        return {
+            "AUD": FALLBACK_USD_IDR / FALLBACK_USD_AUD,
+            "SGD": FALLBACK_USD_IDR / FALLBACK_USD_SGD,
+        }
+
+
+def australian_resident_tax(annual_income: float) -> float:
+    """2026-27 Australian resident individual income tax + Medicare levy."""
+    income = max(0.0, float(annual_income))
+
+    if income <= 18_200:
+        tax = 0.0
+    elif income <= 45_000:
+        tax = (income - 18_200) * 0.16
+    elif income <= 135_000:
+        tax = 4_288 + (income - 45_000) * 0.30
+    elif income <= 190_000:
+        tax = 31_288 + (income - 135_000) * 0.37
+    else:
+        tax = 51_638 + (income - 190_000) * 0.45
+
+    return tax + income * AU_MEDICARE_LEVY
+
+
+def singapore_resident_tax(annual_income: float) -> float:
+    """Singapore resident progressive tax rates from YA 2024 onward."""
+    income = max(0.0, float(annual_income))
+
+    brackets = [
+        (20_000, 0.00),
+        (30_000, 0.02),
+        (40_000, 0.035),
+        (80_000, 0.07),
+        (120_000, 0.115),
+        (160_000, 0.15),
+        (200_000, 0.18),
+        (240_000, 0.19),
+        (280_000, 0.195),
+        (320_000, 0.20),
+        (500_000, 0.22),
+        (1_000_000, 0.23),
+        (float("inf"), 0.24),
+    ]
+
+    tax = 0.0
+    previous = 0.0
+
+    for upper, rate in brackets:
+        taxable = max(0.0, min(income, upper) - previous)
+        tax += taxable * rate
+        if income <= upper:
+            break
+        previous = upper
+
+    return tax
+
+
+def normalize_salary_to_annual(
+    low: float | None,
+    high: float | None,
+    period: str,
+) -> tuple[float | None, float | None]:
+    if low is None or high is None:
+        return None, None
+
+    multiplier = {
+        "annual": 1.0,
+        "monthly": 12.0,
+        "weekly": 52.0,
+        "hourly": 40.0 * 52.0,
+    }.get(period)
+
+    if multiplier is None:
+        return None, None
+
+    return float(low) * multiplier, float(high) * multiplier
+
+
+def calculate_salary(job: Job, fx_rates: dict[str, float]) -> None:
+    """Convert the salary midpoint into estimated monthly take-home IDR."""
+    if job.salary_status not in {"posted", "estimated"}:
+        return
+
+    currency = job.salary_currency.upper()
+    if currency not in {"AUD", "SGD"}:
+        return
+
+    annual_low, annual_high = normalize_salary_to_annual(
+        job.salary_low,
+        job.salary_high,
+        job.salary_period,
+    )
+
+    if annual_low is None or annual_high is None:
+        return
+
+    annual_low = max(0.0, annual_low)
+    annual_high = max(annual_low, annual_high)
+
+    job.salary_low = annual_low
+    job.salary_high = annual_high
+    job.salary_period = "annual"
+    job.salary_average = (annual_low + annual_high) / 2.0
+    job.fx_to_idr = fx_rates[currency]
+
+    if currency == "AUD":
+        tax = australian_resident_tax(job.salary_average)
+        job.tax_note = (
+            "Australia tax estimate assumes an ongoing full-year Australian "
+            "tax resident and includes the 2% Medicare levy; foreign-resident "
+            "tax treatment can differ materially."
+        )
+    else:
+        tax = singapore_resident_tax(job.salary_average)
+        job.tax_note = (
+            "Singapore tax estimate assumes an ongoing full-year Singapore "
+            "tax resident, no CPF for a foreign employee, and no spouse/child "
+            "tax relief unless eligibility is specifically known."
+        )
+
+    net_annual = max(0.0, job.salary_average - tax)
+    job.net_monthly_idr = (net_annual / 12.0) * job.fx_to_idr
+
+
+def format_local_salary(job: Job) -> str:
+    if job.salary_average is None or not job.salary_currency:
+        return "💰 Salary: Not available"
+
+    currency_symbol = {"AUD": "A$", "SGD": "S$"}.get(
+        job.salary_currency,
+        job.salary_currency + " ",
+    )
+
+    low = job.salary_low or 0.0
+    high = job.salary_high or 0.0
+    avg = job.salary_average
+
+    if abs(high - low) < 0.5:
+        band = f"{currency_symbol}{low:,.0f}"
+    else:
+        band = f"{currency_symbol}{low:,.0f}–{currency_symbol}{high:,.0f}"
+
+    if job.salary_status == "posted":
+        source = "From job posting itself"
+    else:
+        source = "Estimate — not official"
+
+    confidence = (
+        f" · {job.salary_confidence} confidence"
+        if job.salary_confidence and job.salary_status == "estimated"
+        else ""
+    )
+
+    return (
+        f"💰 Gross: {band}/year "
+        f"(avg {currency_symbol}{avg:,.0f}) · {source}{confidence}"
+    )
+
+
+def format_net_idr(job: Job) -> str:
+    if job.net_monthly_idr is None:
+        return "💵 Est. net: Not available"
+
+    return (
+        f"💵 Est. net after income tax: "
+        f"Rp {job.net_monthly_idr / 1_000_000:,.1f}M/month"
+    )
 
 
 def init_db() -> None:
@@ -786,6 +1064,13 @@ def send_email(jobs: list[Job]) -> None:
             "<p>Ranked by CV fit, Enterprise AI trajectory, visa feasibility "
             "and company quality. Specific employer + specific role only.</p>"
         ),
+        (
+            "<p><b>Salary note:</b> Posted salary figures are taken from the "
+            "job posting itself. Estimated salary bands and take-home figures "
+            "are estimates only and are not official. Take-home estimates use "
+            "the candidate profile (foreign national, married, 1 child) and "
+            "country-specific tax assumptions.</p>"
+        ),
     ]
 
     for rank, job in enumerate(jobs, 1):
@@ -805,6 +1090,13 @@ def send_email(jobs: list[Job]) -> None:
                 <br>
                 {escape(job.label)}
                 · {escape(job.visa)}
+            </p>
+            <p>
+                <b>{escape(format_local_salary(job))}</b><br>
+                {escape(format_net_idr(job))}
+            </p>
+            <p>
+                <b>Tax assumption:</b> {escape(job.tax_note or "Not available")}
             </p>
             <p>
                 <b>Why it fits:</b> {escape(job.rationale)}
@@ -876,6 +1168,16 @@ def main() -> None:
     )
 
     selected = select_top_20(qualifying)
+
+    fx_rates = fetch_fx_to_idr()
+    print(
+        "FX rates used for salary conversion: "
+        f"1 AUD = IDR {fx_rates['AUD']:,.0f}; "
+        f"1 SGD = IDR {fx_rates['SGD']:,.0f}"
+    )
+
+    for job in selected:
+        calculate_salary(job, fx_rates)
 
     for rank, job in enumerate(selected, 1):
         job.current_rank = rank
