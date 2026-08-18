@@ -118,6 +118,7 @@ class Job:
     posted_at: datetime | None = None
     posted_date_text: str = ""
     freshness_days: int | None = None
+    source_company: str = ""
 
 
 def env(name: str, default: str | None = None, required: bool = False) -> str:
@@ -285,6 +286,43 @@ def is_specific_linkedin_job(url: str) -> bool:
     )
 
 
+def extract_linkedin_employer(search_title: str) -> str:
+    """
+    Extract the employer from common LinkedIn SERP title formats.
+
+    Examples:
+      "Workiva hiring Solutions Architect in Singapore, Singapore | LinkedIn"
+      "Microsoft hiring Data and AI Solution Architect in Singapore | LinkedIn"
+      "Solutions Architect at Workiva | LinkedIn"
+    """
+    text = re.sub(r"\s+", " ", (search_title or "")).strip()
+
+    patterns = [
+        r"^(?P<company>.+?)\s+hiring\s+.+?(?:\s+in\s+.+?)?\s*\|\s*LinkedIn\s*$",
+        r"^(?P<title>.+?)\s+at\s+(?P<company>.+?)\s*\|\s*LinkedIn\s*$",
+    ]
+
+    for pattern in patterns:
+        match = re.match(pattern, text, flags=re.I)
+        if match:
+            company = match.groupdict().get("company", "").strip()
+            if company:
+                return company
+
+    # Some LinkedIn results omit the "| LinkedIn" suffix.
+    match = re.match(
+        r"^(?P<company>.+?)\s+hiring\s+.+?(?:\s+in\s+.+?)?$",
+        text,
+        flags=re.I,
+    )
+    if match:
+        company = match.group("company").strip()
+        if company:
+            return company
+
+    return ""
+
+
 GENERIC_TITLE_PATTERNS = [
     r"\bvarious\b",
     r"\bmultiple companies\b",
@@ -418,6 +456,11 @@ def discover_jobs() -> list[Job]:
                     url=url,
                     snippet=snippet,
                     source_query=query,
+                    source_company=(
+                        extract_linkedin_employer(title)
+                        if is_linkedin(url)
+                        else ""
+                    ),
                 ),
             )
             # Serper/Google frequently exposes a relative posting date in the
@@ -529,6 +572,12 @@ IMPORTANT POSTING-QUALITY RULES:
   any page that does not identify one actual vacancy.
 - company must be the ACTUAL EMPLOYER.
 - title must be the ACTUAL JOB TITLE.
+- NEVER infer the employer from a company merely mentioned in the job
+  description, page text, technology stack, customer list, or search snippet.
+- For LinkedIn results, the employer shown in the LinkedIn result title is
+  authoritative. If the result says "Workiva hiring Solutions Architect",
+  the employer is Workiva even if the page text mentions Anthropic, OpenAI,
+  Microsoft, AWS, or another company.
 - Never invent a company or title from examples mentioned on an aggregator page.
 - If one specific company + one specific role cannot be confidently identified,
   set is_specific_posting=false and is_target=false.
@@ -595,7 +644,24 @@ Return a concise rationale and 2-4 concrete CV tweaks.
 
     data = json.loads(response.output_text)
 
-    job.company = data["company"].strip()
+    model_company = data["company"].strip()
+    source_company = job.source_company.strip()
+
+    if source_company:
+        if (
+            model_company
+            and re.sub(r"\W+", "", model_company.lower())
+            != re.sub(r"\W+", "", source_company.lower())
+        ):
+            print(
+                f"[WARN] Employer mismatch for {job.url}: "
+                f"model={model_company!r}, source={source_company!r}. "
+                "Using source employer."
+            )
+        job.company = source_company
+    else:
+        job.company = model_company
+
     job.title = data["title"].strip()
     job.location = data["location"].strip()
     job.score = int(data["score"])
@@ -851,6 +917,9 @@ def score_jobs(
                 previous_score, previous_rank = get_history(scored.url)
                 scored.previous_score = previous_score
                 scored.previous_rank = previous_rank
+
+                if scored.source_company:
+                    scored.company = scored.source_company
 
                 if (
                     scored.status == "target"
